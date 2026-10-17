@@ -77,6 +77,29 @@ type writeRequest struct {
 	frame  Frame
 	seq    uint32
 	result chan writeResult
+	owner  *writeOwner
+}
+
+// writeOwner hands frame.data back and forth between the writer and sendLoop.
+//
+// frame.data is the caller's buffer and is not copied. sendLoop reads it only
+// while holding mu, and skips the request if the writer has abandoned it.
+// A writer that returns before its result arrives (session closed, socket
+// error, deadline) takes mu and sets abandoned, so once writeFrameInternal
+// returns, sendLoop never touches the buffer again and the caller may reuse it.
+type writeOwner struct {
+	mu        sync.Mutex
+	abandoned bool
+}
+
+// abandon is called by a writer giving up on its request. It waits for
+// sendLoop to finish reading frame.data if it is doing so right now: a memcpy
+// into the send buffer, or with scatter-gather I/O the socket write itself,
+// which Session.Close unblocks by closing the connection.
+func (o *writeOwner) abandon() {
+	o.mu.Lock()
+	o.abandoned = true
+	o.mu.Unlock()
 }
 
 // writeResult represents the result of a write request
@@ -620,6 +643,15 @@ EVENT_LOOP:
 					goto EVENT_LOOP
 				}
 
+				// The writer may have given up on this request already; its
+				// buffer then belongs to the caller again and must not be read.
+				owner := request.owner
+				owner.mu.Lock()
+				if owner.abandoned {
+					owner.mu.Unlock()
+					continue
+				}
+
 				buf[0] = request.frame.ver
 				buf[1] = request.frame.cmd
 				binary.LittleEndian.PutUint16(buf[2:], uint16(len(request.frame.data)))
@@ -630,8 +662,11 @@ EVENT_LOOP:
 					vec[0] = buf[:headerSize]
 					vec[1] = request.frame.data
 					n, err = bw.WriteBuffers(vec)
+					vec[1] = nil
+					owner.mu.Unlock()
 				} else {
 					copy(buf[headerSize:], request.frame.data)
+					owner.mu.Unlock()
 					n, err = s.conn.Write(buf[:headerSize+len(request.frame.data)])
 				}
 
@@ -674,6 +709,7 @@ func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class C
 		frame:  f,
 		seq:    atomic.AddUint32(&s.requestID, 1),
 		result: make(chan writeResult, 1),
+		owner:  new(writeOwner),
 	}
 	select {
 	case s.shaper <- req:
@@ -685,14 +721,19 @@ func (s *Session) writeFrameInternal(f Frame, deadline <-chan time.Time, class C
 		return 0, ErrTimeout
 	}
 
+	// From here on sendLoop may read f.data, so every early return abandons
+	// the request first: the caller is free to reuse its buffer once we return.
 	select {
 	case result := <-req.result:
 		return result.n, result.err
 	case <-s.die:
+		req.owner.abandon()
 		return 0, io.ErrClosedPipe
 	case <-s.chSocketWriteError:
+		req.owner.abandon()
 		return 0, s.socketWriteError.Load().(error)
 	case <-deadline:
+		req.owner.abandon()
 		return 0, ErrTimeout
 	}
 }
